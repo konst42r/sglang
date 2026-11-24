@@ -25,7 +25,11 @@ from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
-    from sgl_kernel_npu.operators.indexer import mlp_lightning_indexer
+    from sgl_kernel_npu.operators.indexer import (
+        mlp_lightning_indexer,
+        quant_lightning_indexer,
+        quant_lightning_indexer_metadata,
+    )
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -653,10 +657,12 @@ class DSANPUIndexerMixin:
                 )
 
                 if pool.index_k_store_dtype == torch.int8:
-                    # INT8 keys require FP16 weights
+                    # INT8 keys require FP16 weights and scales. torch_npu's
+                    # builtin npu_quant_lightning_indexer does not support INT8
+                    # keys; use sgl-kernel-npu's quant_lightning_indexer
+                    # (cann-recipes, migrated FP8/INT8 modes) together with its
+                    # required metadata op.
                     op_weights = weights.to(torch.float16)
-                    # torch_npu.npu_quant_lightning_indexer is not working
-                    # for int8 cache in case of custom_ops imported
                     # The CANN int8 quant lightning indexer requires 64 query
                     # heads; GLM-5.2's indexer has 32. Zero-pad the extra
                     # heads: their weights are zero, so they add nothing to
@@ -668,29 +674,81 @@ class DSANPUIndexerMixin:
                             query_scale, (0, pad_heads)
                         )
                         op_weights = torch.nn.functional.pad(op_weights, (0, pad_heads))
+                    # The metadata plan depends only on the batch shape and the
+                    # (padded) head count, so it is built once per forward and
+                    # reused by every indexer layer (PR #40591). It is built
+                    # from the final lengths, which are already the query
+                    # shard's when sharding is active; all construction ops are
+                    # device ops, so under graph capture the plan is recorded
+                    # and rebuilt from the static buffers on every replay.
+                    plan = getattr(forward_batch, "npu_quant_indexer_plan", None)
+                    if plan is None:
+                        cu_seqlens_q = torch.cat(
+                            [
+                                torch.zeros(1, dtype=torch.int32, device=query.device),
+                                actual_seq_lengths_q.to(
+                                    device=query.device, dtype=torch.int32
+                                ),
+                            ]
+                        )
+                        seqused_k = actual_seq_lengths_kv.to(
+                            device=query.device, dtype=torch.int32
+                        )
+                        common = dict(
+                            cu_seqlens_q=cu_seqlens_q,
+                            seqused_k=seqused_k,
+                            cmp_residual_k=torch.zeros_like(seqused_k),
+                            layout_q="TND",
+                            layout_k="PA_BBND",
+                            mask_mode=3,
+                            cmp_ratio=1,
+                        )
+                        metadata = quant_lightning_indexer_metadata(
+                            query.shape[1],
+                            1,
+                            self.head_dim,
+                            self.index_topk,
+                            2,
+                            **common,
+                        )
+                        plan = (common, metadata)
+                        forward_batch.npu_quant_indexer_plan = plan
+                    common, metadata = plan
+                    topk_indices, _ = quant_lightning_indexer(
+                        query,
+                        past_key_states,
+                        op_weights,
+                        query_scale,
+                        pool.get_index_k_scale_buffer(layer_id),
+                        self.index_topk,
+                        2,
+                        block_table=block_table,
+                        metadata=metadata,
+                        **common,
+                    )
+                    topk_indices = topk_indices.squeeze(1)
                 else:
                     op_weights = weights
-
-                # custom_ops can replace the torch_npu alias with a different schema.
-                topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
-                    # topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=op_weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                ).squeeze(1)
+                    # custom_ops can replace the torch_npu alias with a
+                    # different schema.
+                    topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
+                        query=query,
+                        key=past_key_states,
+                        weights=op_weights,
+                        query_dequant_scale=query_scale,
+                        key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                        actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                        actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                            device=k.device, dtype=torch.int32
+                        ),
+                        block_table=block_table,
+                        layout_query="TND",
+                        layout_key="PA_BSND",
+                        sparse_count=self.index_topk,
+                        sparse_mode=3,
+                        query_quant_mode=0,
+                        key_quant_mode=0,
+                    ).squeeze(1)
             else:
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=query,
