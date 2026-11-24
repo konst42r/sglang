@@ -103,7 +103,8 @@ def _get_npu_quant_indexer_plan(
         common = dict(
             cu_seqlens_q=cu_seqlens_q,
             seqused_k=seqused_k,
-            cmp_residual_k=torch.zeros_like(seqused_k),
+            # cmp_residual_k must stay null while cmp_ratio == 1 (CANN
+            # constraint); the ops default it to None.
             layout_q="TND",
             layout_k="PA_BBND",
             mask_mode=3,
