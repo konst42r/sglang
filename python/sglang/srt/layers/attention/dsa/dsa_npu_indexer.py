@@ -657,6 +657,17 @@ class DSANPUIndexerMixin:
                     op_weights = weights.to(torch.float16)
                     # torch_npu.npu_quant_lightning_indexer is not working
                     # for int8 cache in case of custom_ops imported
+                    # The CANN int8 quant lightning indexer requires 64 query
+                    # heads; GLM-5.2's indexer has 32. Zero-pad the extra
+                    # heads: their weights are zero, so they add nothing to
+                    # the per-key score (sum over heads of w * relu(q . k)).
+                    if query.shape[1] < 64:
+                        pad_heads = 64 - query.shape[1]
+                        query = torch.nn.functional.pad(query, (0, 0, 0, pad_heads))
+                        query_scale = torch.nn.functional.pad(
+                            query_scale, (0, pad_heads)
+                        )
+                        op_weights = torch.nn.functional.pad(op_weights, (0, pad_heads))
                 else:
                     op_weights = weights
 
