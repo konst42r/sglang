@@ -672,7 +672,8 @@ class DSANPUIndexerMixin:
                     op_weights = weights
 
                 # custom_ops can replace the torch_npu alias with a different schema.
-                topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
+                # topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
+                topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=op_weights,
